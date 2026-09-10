@@ -1,9 +1,35 @@
 '''
-A script (and a function) to partially de-identify an HL7 v2.x message.
+A script (and a function) to partially de-identify an HL7 message.
 Full de-identification is not possible without knowing the details of any HL7 extensions
 that exist in the message, such as extra fields in segments, or Z segments.
 And missed de-identification can occur if senders misuse standard fields for non-standard data,
 such as putting the patient's birth name in withdrawn fields like the Social Security Number Field.
+
+SCRIPT SYNOPSIS:
+$ python DeIdentifyHL7message.py
+                [-I inputDir|--inputDir=inputDir] [-O outputDir|--outputDir=outputDir]
+                [-D dataDir|--dataDir=dataDir] [-T testData|--testData=testData]
+                [-v level|--verbose=level] [-L logDir|--logDir=logDir] [-l logFile|--logFile=logFile]
+
+PARAMETERS
+-I inputDir|--inputDir=inputDir             The folder where the messages to be deidentified will be found (default='./input')
+
+-O outputDir|--outputDir=outputDir          The folder where the deidentified message will be saved (default='./output')
+
+-D dataDir|--dataDir=dataDir                The folder where the data files and population health files will be found (default='./data')
+
+-T testData|--testData=testData             The Excel Workbook of demographic data to be used for person deidentification (default='./data/testHealthPopulation.xlsx')
+
+-p PIDfieldsToPreserve|--preservePID=PIDfieldsToPreserve        A comma separated list of PID fields not to be de-identified
+
+-d PRD|--preservePRD=PRDfieldsToPreserve        A comma separated list of PRD fields not to be de-identified
+
+-v level|--vervose=level                    The debug level of detail in the debug log file
+
+-L logDir|--logDir=logDir                   The folder where the log file will be created (default='logs')
+
+-l logFile|--logFile=logFile                The name of the file of log messages. If not specified, log message will be sent to the screen
+
 '''
 
 import sys
@@ -24,6 +50,7 @@ import base64
 import random
 import pandas as pd
 from openpyxl import load_workbook
+
 LoremIpsum = {}         # Paragraphs, sentences, words of random latin
 LoremIpsum_PDF = None
 LoremIpsum_PNG = None
@@ -37,20 +64,50 @@ patients = []
 doctors = []
 providers = []
 organisations = []
+authorities = set()
 fieldSep = compSep = repSep = escChar = subCompSep = None
 
 # Set the following variables at command run time
 dataDir = './data/.'                # MUST CONTAIN the file LorumIpsum.txt
 testHealthPopulation = 'testHealthPopulation.xlsx'
+preserveMR = True
+
+# Specify what to deidentify.
+# deidentify[] - This is a list of segments and/or fields to deidentify
+# By default, deidentifyHL7message() will deidentify person and organisation related data (XCN and XON datatypes)
+# or potentially person related data, such as OBX-5 for FT/ED etc. datatypes, when the matching segment is listed in deidentify[].
+# For other fields you'll need to specify both the segment and the field. e.g. to deidentify MSH-3 you would need ['MSH', 'MSH-3']
+# Fields not deidentified if just the segment is in deidentify[]
+# MSH-3, MSH-4, MSH-5, MSH-6, MSA-3, NTE-3, PV1-3, PV1-6, PV1-11, PV1-14, PV1-15, PV1-16, PV1-42, PV1-43, PV2-22,
+# NK1-3, MRG-1, MRG-2, MRG-3, MRG-4, MRG-5, MRG-6, PD1-12, PD1-14, PDA-2, ORC-13, OBR-4, OBR-13, OBR-20, OBR-21,
+# RXD-9, ACC-3, OBX-5 [for CE, CNE, CWE and CF datatypes - all other datatype are deidentified if you select 'OBX'],
+# PES-7, PES-8, FAC-1, OM1-6, OM1-8, OM1-9, OM1-10, OM1-11, OM1-16, OM1-27, OM1-32, OM1-33, OM1-37, OM1-39, OM1-41,
+# LOC-1, LRL-1, LRL-4, LRL-5, LRL-6, LDP-1, VAR-6
+#
+# So, what is deidetified, by default, when you specify a segment
+# MSH, MSA, NTE - nothing, EVN-5,
+# PID everything; the whole segment, but the MR number can be preserved and you can specify individual fields that are to be preserved,
+# PV1-7,8,9 17, 52, PV2-23,
+# NK1-2,4,5,6,10,13,14,15,16,25,26,27,27,30,31,32,35, IAM-18,19, MRG-7, PD1-3,4,10, DB1-3, PDA-5,6, ORC-10,11,12,14,19,21,22,23,24,
+# OBR-4,13,16,20[with DR=value copied from PV1-9],28,32,33,34,35, RXO-14,15, RXE-13,14, RXD-10, DSP-3, PRA-8,11,12,
+# GT1-3,4,5,6,7,16,17,18, IN1-3,4,5,6,7,16,18,19,30, IN2-3,7,9,12,13,22,23,39,40,41,42,43,49,50,52,53, IN3-3,8,14,15,16,18,19,25,
+# ACC-7,8,9, ABS-1,5,8,OBX-5[except CE,CNE,CWE and CF datatypes], PES-1,2,3,4, PEO-7,13,14,15,16,17,19,20,21, FAC-3,4,5,7,8,
+# OM1-17,28,29, OM7-20, LOC-2,4,5,6, LRL - nothing, LDP-2,11, LCC-1, CM0-5,9,10, TXA-5,9,10,11,23,22, ARQ-15,
+# SCH-12,13,14,15,16,17,18,19,20,21,22, AIL-3,
+# PRD everything but you can specify individual fields that are to be preserved,
+# CTD-2,3,4,5, ROL-10,11,12, VAR-6, AFF-2,3, EDU-6,8,
+# STF-3,5,6,8,10,11,15,17,18,22,27,28
+
+deidentify = ["PID", "PD1", "PV1", "NK1", "ORC", "OBR"]
 
 # This function will initialise itself with data from the 'dataDir'
 # Specifically the files 'LoremIpsum.txt', 'LoremIpsum.pdf', 'LoremIpsum.png', 'LoremIpsum.gif', 'LoremIpsum.jpg', 'LoremIpsum.tiff' and the Excel Workbook testDemographics.xlsx
 # which can be created with the mkHealthPopulation.py script (https://github.com/russellmcdonell/mkHealth_Population-Australia)
 def deidentifyHL7message(segments):
     # Deidentify an HL7 message
-    global LoremIpsum, LOremIpsum_PDF, LoremIpsum_PNG, LoremIpsum_GIF, LoremIpsum_JPG, LoremIpsum_TIFF, allText, allFT
-    global wb, patients, doctors, providers, fieldSep, compSep, repSep, escChar, subCompSep, dataDir
-    global preservePID, preservePRD
+    global LoremIpsum, LOremIpsum_PDF, LoremIpsum_PNG, LoremIpsum_GIF, LoremIpsum_JPG, LoremIpsum_TIFF
+    global allText, allFT,  wb, patients, doctors, providers, fieldSep, compSep, repSep, escChar, subCompSep, dataDir
+    global deidentify, preservePID, preservePRD
     if len(LoremIpsum) == 0:
         with open(os.path.join(dataDir, "LoremIpsum.txt"), 'r', newline='') as LoremIpsumFile:
             for para in LoremIpsumFile:
@@ -155,6 +212,13 @@ def deidentifyHL7message(segments):
                 heading = False
                 continue
             providers.append(row[1].value)
+        for sheet in ['Health Networks', 'Private Hospitals', 'GP Clinics', 'Specialist Services']:
+            ws = wb[sheet]
+            data = list(ws.values)
+            df = pd.DataFrame(data[1:], columns=data[0])
+            dfData = df.to_dict(orient='records')
+            for row in dfData:
+                authorities.add(row['authority'])
 
     # Deidentify the HL7 message
     if segments[0][0:3] == 'MSH':
@@ -177,32 +241,41 @@ def deidentifyHL7message(segments):
     PV1_9 = None
     for i, segment in enumerate(segments):
         seg = segment[0:3]
+        if seg not in deidentify:
+            continue
         fields = segment.split(fieldSep)
         # Chapter 2 Segments
-        if seg == 'MSH':                                    # De-identify MSH-3,4,5,6
+        if seg == 'MSH':                                                # De-identify MSH-3,4,5,6
             # Sending Application, Sending Facility, Receiving Application, Receiving Facility
             for field in range(2, 6):
-                mkText(fields, field)
-        elif seg == 'MSA':                                  # De-identify MSA-3
-            mkText(fields, 3)                           # Text message
-        elif seg == 'NTE':                                  # De-identify NTE-3
-            mkFT(fields, 3)                             # Comment
+                if 'MSH-' + str(field + 1) in deidentify:
+                    mkText(fields, field)
+        elif seg == 'MSA':                                              # De-identify MSA-3
+            if 'MSA-3' in deidentify:                       # Text message
+                mkText(fields, 3)
+        elif seg == 'NTE':                                              # De-identify NTE-3
+            if 'NTE-3' in deidentify:                       # Comment
+                mkFT(fields, 3)
         # Chapter 3 Segments
         elif seg == 'EVN':                                  # De-identify EVN-5
-            mkXCN(fields, 5, compSep, True)             # Operator ID
-        elif seg == 'PID':                                  # De-identify PID - replace whole segment
+            mkXCN(fields, 5, compSep, True)                 # Operator ID
+        elif seg == 'PID':                                              # De-identify PID - replace whole segment
             newPID = random.choice(patients)
-            if newPID.find('<UR>') != -1:               # Preserve UR is possible
-                PID3s = fields[3].split('repSep')
-                for id in PID3s:
-                    idParts = id.split(compSep)
-                    if (len(idParts) > 4) and (idParts[4] == 'MR'):
-                        newPID = newPID.replace('<UR>', idParts[0])
-                        newPID = newPID.replace('<AUTH>', idParts[3])
-                        break
-                else:
-                    newPID = newPID.replace('<UR>', str(99999999))
-                    newPID = newPID.replace('<AUTH>', 'unknown')
+            if preserveMR:
+                if newPID.find('<UR>') != -1:                       # Preserve UR if possible
+                    PID3s = fields[3].split(repSep)
+                    for id in PID3s:
+                        idParts = id.split(compSep)
+                        if (len(idParts) > 4) and (idParts[4] == 'MR'):
+                            newPID = newPID.replace('<UR>', idParts[0])
+                            newPID = newPID.replace('<AUTH>', idParts[3])
+                            break
+                    else:
+                        newPID = newPID.replace('<UR>', str(random.choice(range(1,99999999))))
+                        newPID = newPID.replace('<AUTH>', random.choice(list(authorities)))
+            else:
+                newPID = newPID.replace('<UR>', str(random.choice(range(1,99999999))))
+                newPID = newPID.replace('<AUTH>', random.choice(list(authorities)))
             if len(preservePID) > 0:
                 oldPIDfields = seg.split(fieldSep)
                 newPIDfields = newPID.split('|')
@@ -217,36 +290,39 @@ def deidentifyHL7message(segments):
             newPID.replace('\\', escChar)
             segments[i] = newPID
             continue
-        elif seg == 'PV1':                                  # De-identify PV1-3,6,7,8,9,11,14,15,16,17,42,43,52
+        elif seg == 'PV1':                                              # De-identify PV1-3,6,7,8,9,11,14,15,16,17,42,43,52
             for field in [3, 6, 11, 14, 15, 16, 42, 43]:        # Locations
-                mkText(fields, field)
-            mkXCN(fields, 7, compSep, False)            # Attending
-            mkXCN(fields, 8, compSep, False)            # Referring
-            mkXCN(fields, 9, compSep, False)            # Consulting
+                if 'PV1-' + str(field) in deidentify:
+                    mkText(fields, field)
+            mkXCN(fields, 7, compSep, False)                    # Attending
+            mkXCN(fields, 8, compSep, False)                    # Referring
+            mkXCN(fields, 9, compSep, False)                    # Consulting
             if (len(fields) <= 9) or (fields[9] == ''):
                 PV1_9 = None
             else:
                 comps = fields[9].split(compSep)
                 PV1_9 = comps[0]
-            mkXCN(fields, 17, compSep, False)           # Admitting
-            mkXCN(fields, 52, compSep, False)           # Other
-        elif seg == 'PV2':                                  # De-identify PV2-22,23
-            mkText(fields, 22)                          # Visit Protection Indicator
-            mkXON(fields, 23)                           # Clinic Organisation Name
-        elif seg == 'NK1':                                  # De-identify NK1-2,3,4,5,6,10,14,15,16,25,26,27,28,30,31,32,35
+            mkXCN(fields, 17, compSep, False)                   # Admitting
+            mkXCN(fields, 52, compSep, False)                   # Other
+        elif seg == 'PV2':                                              # De-identify PV2-22,23
+            if 'PV2-22' in deidentify:                          # Visit Protection Indicator
+                mkText(fields, 22)
+            mkXON(fields, 23)                                   # Clinic Organisation Name
+        elif seg == 'NK1':                                              # De-identify NK1-2,3,4,5,6,10,14,15,16,25,26,27,28,30,31,32,35
             pid = random.choice(patients)
             pidFields = pid.split(fieldSep)
             cpid = random.choice(patients)
             cpidFields = cpid.split(fieldSep)
             if (len(fields) > 2) and (fields[2] != ''):         # Name
                 fields[2] = pidFields[5]
-            mkText(fields, 3)           # Relationship
+            if 'NK1-3' in deidentify:                           # Relationship
+                mkText(fields, 3)
             if (len(fields) > 4) and (fields[4] != ''):
                 fields[4] = pidFields[11]
-            mkXTN(fields, 5, True)                      # Phone
-            mkXTN(fields, 6, True)                      # Business phone
-            mkText(fields, 10)                          # NoK Title
-            mkXON(fields, 13)                           # Organisation Name
+            mkXTN(fields, 5, True)                              # Phone
+            mkXTN(fields, 6, True)                              # Business phone
+            mkText(fields, 10)                                  # NoK Title
+            mkXON(fields, 13)                                   # Organisation Name
             if (len(fields) > 14) and (fields[14] != ''):       # Marital Status
                 fields[14] = pidFields[16]
             if (len(fields) > 15) and (fields[15] != ''):       # Sex
@@ -261,61 +337,70 @@ def deidentifyHL7message(segments):
                 fields[27] = pidFields[28]
             if (len(fields) > 28) and (fields[28] != ''):       # Ethnicity
                 fields[28] = pidFields[22]
-            mkXPN(fields, 30)                           # Contact Person Name
-            mkXTN(fields, 31,True)                      # Contact Person Telephone number
-            mkXAD(fields, 32)                           # Contact Person Address
+            mkXPN(fields, 30)                                   # Contact Person Name
+            mkXTN(fields, 31,True)                              # Contact Person Telephone number
+            mkXAD(fields, 32)                                   # Contact Person Address
             if (len(fields) > 35) and (fields[35] != ''):       # Race
                 fields[35] = cpidFields[10]
-        elif seg == 'IAM':                                  # De-identify IAM-18,19
-            mkXCN(fields, 18, compSep, True)            # Statused by person
-            mkXON(fields, 19)                           # Statused by organisation
-        elif seg == 'MRG':                                  # De-identify MRG-1,2,3,4,5,6,7
+        elif seg == 'IAM':                                              # De-identify IAM-18,19
+            mkXCN(fields, 18, compSep, True)                    # Statused by person
+            mkXON(fields, 19)                                   # Statused by organisation
+        elif seg == 'MRG':                                              # De-identify MRG-1,2,3,4,5,6,7
             for field in range(1, 7):
-                if field < 3:                           # ID, Alt ID
-                    mkCX(fields, field, True)
-                elif field in [3, 5, 6]:                # Account and Visit IDs
-                    fields[field] = mkText(fields, field)
-                else:
-                    mkCX(fields, field, False)          # Prior ID
-            mkXPN(fields, 7)                            # Patient's Prior Name
-        elif seg == 'PD1':                                  # De-identify PD1-3,4,10,12
-            mkXON(fields, 3)                            # Organisation
-            mkXCN(fields, 4, compSep, True)             # Primary Care Provider
-            mkCX(fields, 10, True)                      # Duplicate Patient
-            mkText(fields, 12)                          # Protection Indicator
-            mkText(fields, 14)                          # Place of workship
-        elif seg == 'DB1':                                  # De-identify DB1-3
-            mkCX(fields, 3, True)                       # Disabled Person ID
-        elif seg == 'PDA':                                  # De-identify PDA-2,5,8
-            mkText(fields, 2)                           # Death location
-            mkXCN(fields, 5, compSep, True)             # Death Certified by
-            mkXCN(fields, 8, compSep, True)             # Autopsy Performed by
+                if 'MRG-' + str(field) in deidentify:
+                    if field < 3:                               # ID, Alt ID
+                        mkCX(fields, field, True)
+                    elif field in [3, 5, 6]:                    # Account and Visit IDs
+                        fields[field] = mkText(fields, field)
+                    else:
+                        mkCX(fields, field, False)              # Prior ID
+            mkXPN(fields, 7)                                    # Patient's Prior Name
+        elif seg == 'PD1':                                              # De-identify PD1-3,4,10,12
+            mkXON(fields, 3)                                    # Organisation
+            mkXCN(fields, 4, compSep, True)                     # Primary Care Provider
+            mkCX(fields, 10, True)                              # Duplicate Patient
+            if 'PD1-12' in deidentify:                          # Protection Indicator
+                mkText(fields, 12)
+            if 'PD1-14' in deidentify:                          # Place of workship
+                mkText(fields, 14)
+        elif seg == 'DB1':                                              # De-identify DB1-3
+            mkCX(fields, 3, True)                               # Disabled Person ID
+        elif seg == 'PDA':                                              # De-identify PDA-2,5,8
+            if 'PDA-2' in deidentify:                           # Death location
+                mkText(fields, 2)
+            mkXCN(fields, 5, compSep, True)                     # Death Certified by
+            mkXCN(fields, 8, compSep, True)                     # Autopsy Performed by
         # Chapter 4 Segments
-        elif seg == 'ORC':                                  # De-identify ORC-10,11,12,19,21,22,24
-            mkXCN(fields, 10, compSep, True)            # Entered by
-            mkXCN(fields, 11, compSep, True)            # Verified by
-            mkXCN(fields, 12, compSep, True)            # Ordering Provider
-            mkText(fields, 13)                          # Enterer's location
-            mkXTN(fields, 14, True)                     # Call-back telephone number
-            mkXCN(fields, 19, compSep, True)            # Action by
-            mkXON(fields, 21)                           # Ordering Facility name
-            mkoXAD(fields, 22)                          # Ordering Facility address
-            mkXTN(fields,23,True)                       # Ordering Facility phone number
-            mkdXAD(fields, 24)                          # Ordering Provider address
-        elif seg == 'OBR':                                  # De-identify OBR-4.2/5,13,16,20,21,28,32,33,34,35
-            mkCE(fields, 4, False)                      # Universal Service ID (test)
-            mkText(fields, 13)                          # Relevant clinican information
-            mkXCN(fields, 16, compSep, True)            # Ordering Provider
+        elif seg == 'ORC':                                              # De-identify ORC-10,11,12,19,21,22,24
+            mkXCN(fields, 10, compSep, True)                    # Entered by
+            mkXCN(fields, 11, compSep, True)                    # Verified by
+            mkXCN(fields, 12, compSep, True)                    # Ordering Provider
+            if 'ORC-13' in deidentify:                          # Enterer's location
+                mkText(fields, 13)
+            mkXTN(fields, 14, True)                             # Call-back telephone number
+            mkXCN(fields, 19, compSep, True)                    # Action by
+            mkXON(fields, 21)                                   # Ordering Facility name
+            mkoXAD(fields, 22)                                  # Ordering Facility address
+            mkXTN(fields,23,True)                               # Ordering Facility phone number
+            mkdXAD(fields, 24)                                  # Ordering Provider address
+        elif seg == 'OBR':                                              # De-identify OBR-4.2/5,13,16,20,21,28,32,33,34,35
+            if 'OBR-4' in deidentify:                           # Universal Service ID (test)
+                mkCE(fields, 4, False)
+            if 'OBR-13' in deidentify:                          # Relevant clinican information
+                mkText(fields, 13)
+            mkXCN(fields, 16, compSep, True)                    # Ordering Provider
             if (len(fields) > 20) and (fields[20] != ''):       # Filler field 1
-                bits = fields[20].split(',')
-                for j, bit in enumerate(bits):
-                    if bit[j][0:3] == 'DR=':
-                        if PV1_9 is None:
-                            bits[j] = 'DR='
-                        else:
-                            bits[j] = 'DR=' + PV1_9
-                fields[20] = ','.join(bits)
-            mkText(fields, 21)                          # Filler field 2
+                if 'OBR-20' in deidentify:
+                    bits = fields[20].split(',')
+                    for j, bit in enumerate(bits):
+                        if bit[j][0:3] == 'DR=':
+                            if PV1_9 is None:
+                                bits[j] = 'DR='
+                            else:
+                                bits[j] = 'DR=' + PV1_9
+                    fields[20] = ','.join(bits)
+            if 'OBR-21' in deidentify:                          # Filler field 2
+                mkText(fields, 21)
             if (len(fields) > 28) and (fields[28] != ''):       # Results Copies To
                 copies = fields[28].split(repSep)
                 eachDr = set()
@@ -335,55 +420,58 @@ def deidentifyHL7message(segments):
                 # Principal Results Interpreter, Assistant Results Interpreter, Technicial, Transcriptionist
                 if subCompSep is not None:
                     mkXCN(fields, field, subCompSep, False)
-        elif seg == 'RXO':                                  # De-identify RXO-14,15
-            mkXCN(fields, 14, compSep, True)            # Ordering Provider's DEA number
-            mkXCN(fields, 15, compSep, True)            # Pharmacist verifier ID
-        elif seg == 'RXE':                                  # De-identify RXE-13,14
-            mkXCN(fields, 13, compSep, True)            # Ordering PRovider's DEA number
-            mkXCN(fields, 14, compSep, True)            # Pharmacist verifier ID
-        elif seg == 'RXD':                                  # De-identify RXD-9, 10
-            mkText(fields, 9)                           # Dispense notes
-            mkXCN(fields, 10, compSep, True)            # Dispensing prover
+        elif seg == 'RXO':                                              # De-identify RXO-14,15
+            mkXCN(fields, 14, compSep, True)                    # Ordering Provider's DEA number
+            mkXCN(fields, 15, compSep, True)                    # Pharmacist verifier ID
+        elif seg == 'RXE':                                              # De-identify RXE-13,14
+            mkXCN(fields, 13, compSep, True)                    # Ordering PRovider's DEA number
+            mkXCN(fields, 14, compSep, True)                    # Pharmacist verifier ID
+        elif seg == 'RXD':                                              # De-identify RXD-9, 10
+            if 'RXD-9' in deidentify:                           # Dispense notes
+                mkText(fields, 9)
+            mkXCN(fields, 10, compSep, True)                    # Dispensing prover
         # Chapter 5 Segments
-        elif seg == 'DSP':                                  # De-identify DSP-3
-            mkText(fields, 3)                           # Data line
+        elif seg == 'DSP':                                              # De-identify DSP-3
+            mkText(fields, 3)                                   # Data line
         # Chapter 6 Segments
-        elif seg == 'PR1':                                  # De-identify PR1-4,8,11,12
-            mkText(fields, 4)                           # Procedure description
-            mkXCN(fields, 8, compSep, True)             # Anaesthesiologisy
-            mkXCN(fields, 11, compSep, True)            # Surgeon
-            mkXCN(fields, 12, compSep, True)            # Procedure practitioner
-        elif seg == 'GT1':                                  # De-identify GT1-3,4,5,6,7,16,17,18
-            mkXPN(fields, 3)                            # Guarantor's name
-            mkXPN(fields, 4)                            # Guarantors spouse's name
-            mkXAD(fields, 5)                            # Guarantor address
-            mkXTN(fields, 6, True)                      # Guarantor phone
-            mkXTN(fields, 7, True)                      # Guarantor business phone
-            mkXPN(fields, 16)                           # Guarantor employer name
-            mkXAD(fields, 17)                           # Guarantor employer address
-            mkXTN(fields, 18, True)                     # Guarantor employer phone
-        elif seg == 'IN1':                                  # De-identify IN1-3,4,5,6,7,16,18,19,30
-            mkCX(fields, 3)                             # Insurance company ID
-            mkXON(fields, 4)                            # Insurance company name
-            mkoXAD(fields, 5)                           # Insurance company address
-            mkXPN(fields, 6)                            # Insurance company contact person
-            mkXTN(fields, 7, True)                      # Insurance company phone
-            mkXPN(fields, 16)                           # Name of insured
+        elif seg == 'PR1':                                              # De-identify PR1-4,8,11,12
+            if 'PRA-4' in deidentify:                           # Procedure descriptio
+                mkText(fields, 4)
+            mkXCN(fields, 8, compSep, True)                     # Anaesthesiologisy
+            mkXCN(fields, 11, compSep, True)                    # Surgeon
+            mkXCN(fields, 12, compSep, True)                    # Procedure practitioner
+        elif seg == 'GT1':                                              # De-identify GT1-3,4,5,6,7,16,17,18
+            mkXPN(fields, 3)                                    # Guarantor's name
+            mkXPN(fields, 4)                                    # Guarantors spouse's name
+            mkXAD(fields, 5)                                    # Guarantor address
+            mkXTN(fields, 6, True)                              # Guarantor phone
+            mkXTN(fields, 7, True)                              # Guarantor business phone
+            mkXPN(fields, 16)                                   # Guarantor employer name
+            mkXAD(fields, 17)                                   # Guarantor employer address
+            mkXTN(fields, 18, True)                             # Guarantor employer phone
+        elif seg == 'IN1':                                              # De-identify IN1-3,4,5,6,7,16,18,19,30
+            mkCX(fields, 3)                                     # Insurance company ID
+            mkXON(fields, 4)                                    # Insurance company name
+            mkoXAD(fields, 5)                                   # Insurance company address
+            mkXPN(fields, 6)                                    # Insurance company contact person
+            mkXTN(fields, 7, True)                              # Insurance company phone
+            mkXPN(fields, 16)                                   # Name of insured
             if (len(fields) > 18) and (fields[18] != ''):       # Insured's Date of Birth
                 pid = random.choice(patients)
                 pidFields = pid.split(fieldSep)
                 fields[18] = pidFields[7]
-            mkXAD(fields, 19)                           # Insured's address
-            mkXCN(fields, 30, compSep, True)            # Verification by
-        elif seg == 'IN2':                                  # De-identify IN2-3,7,9,12,13,22,23,39,40,41,42,43,49,50,52,53
-            mkXCN(fields, 3, compSep, True)             # Insured Employers ID
-            # Medicaid case name, Military sponsor's name, Special converage approval name, Mother's maiden name, Employer Contact person name, Insured's contact person name
-            for field in [7, 9, 22, 40, 49, 52]:
+            mkXAD(fields, 19)                                   # Insured's address
+            mkXCN(fields, 30, compSep, True)                    # Verification by
+        elif seg == 'IN2':                                              # De-identify IN2-3,7,9,12,13,22,23,39,40,41,42,43,49,50,52,53
+            mkXCN(fields, 3, compSep, True)                     # Insured Employers ID
+            # Medicaid case name, Military sponsor's name, Special converage approval name, Employer Contact person name, Insured's contact person name
+            for field in [7, 9, 22, 49, 52]:
                 mkXPN(fields, field)
+            # Miltary Organisation, Miltary Station, Special coverage approval title
+            for field in [12, 13, 23]:
+                mkText(fields, field)
             pid = random.choice(patients)
             pidFields = pid.split(fieldSep)
-            if (len(fields) > 43) and (fields[43] != ''):       # Marital Status
-                fields[43] = pidFields[16]
             if (len(fields) > 39) and (fields[39] != ''):       # Religion
                 fields[39] = pidFields[17]
             if (len(fields) > 40) and (fields[40] != ''):       # Mother's Maiden Name
@@ -392,40 +480,37 @@ def deidentifyHL7message(segments):
                 fields[41] = pidFields[28]
             if (len(fields) > 42) and (fields[42] != ''):       # Ethnicity
                 fields[42] = pidFields[22]
-            mkText(fields, 12)                          # Military Organisation
-            mkText(fields, 13)                          # Military Station
-            mkText(fields, 23)                          # Special coverage approval title
-            mkXTN(fields, 50, True)                     # Employer contact person phone
-            mkXTN(fields, 53, True)                     # Insured contact person phone
-        elif seg == 'IN3':                                  # De-identify IN3-3,8,14,15,16,18,19,25
+            if (len(fields) > 43) and (fields[43] != ''):       # Marital Status
+                fields[43] = pidFields[16]
+            mkXTN(fields, 50, True)                             # Employer contact person phone
+            mkXTN(fields, 53, True)                             # Insured contact person phone
+        elif seg == 'IN3':                                              # De-identify IN3-3,8,14,15,16,18,19,25
             for field in [3, 8, 14, 25]:
                 # Certified by, Operator, Physician reviewer, Second opinion physician
                 mkXCN(fields, field, compSep, True)
-            mkText(fields, 15)                          # Certification contact
-            mkXTN(fields, 16, True)                     # Certification contact phone
-            mkCE(fields, 18, False)                     # Certification agency
-            mkXTN(fields, 19, True)                     # Certification agency phone
-        elif seg == 'ACC':                                  # De-identify ACC-3,7,8,9
-            mkText(fields, 3)                           # Acccident Location
-            mkXCN(fields, 7, compSep, True)             # Entered by
-            mkText(fields, 8)                           # Accident description
-            mkText(fields, 9)                           # Brought in by
-        elif seg == 'ABS':                                  # De-identify ABS-1,5,8
+            mkText(fields, 15)                                  # Certification contact
+            mkXTN(fields, 16, True)                             # Certification contact phone
+            mkCE(fields, 18, False)                             # Certification agency
+            mkXTN(fields, 19, True)                             # Certification agency phone
+        elif seg == 'ACC':                                              # De-identify ACC-3,7,8,9
+            if 'ACC-3' in deidentify:                           # Acccident Location
+                mkText(fields, 3)
+            mkXCN(fields, 7, compSep, True)                     # Entered by
+            mkText(fields, 8)                                   # Accident description
+            mkText(fields, 9)                                   # Brought in by
+        elif seg == 'ABS':                                              # De-identify ABS-1,5,8
             for field in [1, 5, 8]:
                 # Discharge care provider, Attested by, Abstracted by
                 mkXCN(fields, field, compSep, True)
         # Chapter 7 Segments
-        elif seg == 'OBX':                                  # De-identify OBX-3,5,16
+        elif seg == 'OBX':                                              # De-identify OBX-3,5,16
             datatype = fields[2]
             if datatype != 'ED':
-                mkCE(fields, 3, False)                          # Observation ID
+                if 'OBX-3' in deidentify:                       # Observation ID
+                    mkCE(fields, 3, False)
             if (len(fields) > 5) and (fields[5] != ''):         # Observation
                 if datatype == 'AD':                            # an address
                     mkXAD(fields, 5)
-                elif datatype in ['CE', 'CNE', 'CWE']:          # coded
-                    mkCE(fields, 5, False)
-                elif datatype == 'CF':                          # coded with FT
-                    mkCE(fields, 5, True)
                 elif datatype == 'FN':                          # family name
                     pid = random.choice(patients)
                     pidFields = pid.split(fieldSep)
@@ -475,69 +560,87 @@ def deidentifyHL7message(segments):
                     fields[5] = mkXPN(fields, 5)
                 elif datatype == 'XTN':                         # telephone
                     fields[5] = mkXTN(fields, 5, False)
-            mkCE(fields, 15, False)                                    # Producers ID
-            mkXCN(fields, 16, compSep, True)
-        elif seg == 'PES':                                  # De-identify PES-1,2,3,4,7,8
-            mkXON(fields, 1)                            # Sender organisation name
-            mkXCN(fields, 2, compSep, True)             # Sender individual name
-            mkoXAD(fields, 3)                           # Sender address
-            mkXTN(fields, 4, True)                      # Sender telephone
-            mkFT(fields, 7)                             # Sender event description
-            mkFT(fields, 8)                             # Sender comments
-        elif seg == 'PEO':                                  # De-identify PEO-7,13,14,15,16,17,19,20,21
+                if 'OBX-5' in deidentify:
+                    if datatype in ['CE', 'CNE', 'CWE']:        # coded
+                        mkCE(fields, 5, False)
+                    elif datatype == 'CF':                      # coded with FT
+                        mkCE(fields, 5, True)
+            mkCE(fields, 15, False)                             # Producers ID
+            mkXCN(fields, 16, compSep, True)                    # Responsible Observer
+        elif seg == 'PES':                                              # De-identify PES-1,2,3,4,7,8
+            mkXON(fields, 1)                                    # Sender organisation name
+            mkXCN(fields, 2, compSep, True)                     # Sender individual name
+            mkoXAD(fields, 3)                                   # Sender address
+            mkXTN(fields, 4, True)                              # Sender telephone
+            if 'PES-7' in deidentify:                           # Sender event description
+                mkFT(fields, 7)
+            if 'PES-8' in deidentify:                           # Sender comments
+                mkFT(fields, 8)
+        elif seg == 'PEO':                                              # De-identify PEO-7,13,14,15,16,17,19,20,21
             # Event descriptions from others/original reporter/patient/practitioner/autopsy
             for field in [13, 14, 15, 16, 17]:
                 mkFT(fields, field)
-            mkXAD(fields, 7)                            # Event location orrcured address
-            mkXPN(fields, 19)                           # Primary observer name
-            mkXAD(fields, 20)                           # Primary observer address
-            mkXTN(fields, 21, True)                     # Primary observer phone
-        elif seg == 'FAC':                                  # De-identify FAC-1,3,4,5,7,8
-            mkText(fields, 1)                           # Facility ID
-            mkoXAD(fields, 3)                           # Facility address
-            mkXTN(fields, 4, False)                     # Facility phone
-            mkXCN(fields, 5, compSep, True)             # Contact person
-            mkdXAD(fields, 7)                           # Contact person address
-            mkXTN(fields, 8,True)                       # Contact person phone
+            mkXAD(fields, 7)                                    # Event location orrcured address
+            mkXPN(fields, 19)                                   # Primary observer name
+            mkXAD(fields, 20)                                   # Primary observer address
+            mkXTN(fields, 21, True)                             # Primary observer phone
+        elif seg == 'FAC':                                              # De-identify FAC-1,3,4,5,7,8
+            if 'FAC-1' in deidentify:                           # Facility ID
+                mkText(fields, 1)
+            mkoXAD(fields, 3)                                   # Facility address
+            mkXTN(fields, 4, False)                             # Facility phone
+            mkXCN(fields, 5, compSep, True)                     # Contact person
+            mkdXAD(fields, 7)                                   # Contact person address
+            mkXTN(fields, 8,True)                               # Contact person phone
         # Chapter 8 Segments
-        elif seg == 'OM1':                                  # De-identify OM1-6,8,9,10,11,16,17,27,28,29,32,37,39,40
+        elif seg == 'OM1':                                              # De-identify OM1-6,8,9,10,11,16,17,27,28,29,32,37,39,40
             # Observation description, other names, preferred report name for the observation, preferred short name for observation,
             # Preferred long name for observation, Interpretation of observations, patient preparation,
             # Factors that may affect the observation, Description of test methods
             for field in [6, 8, 9, 10, 11, 32, 37, 39, 41]:
-                mkText(fields, field)
-            mkCE(fields, 16)                            # Observation producing department/section
-            mkXTN(fields, 17, False)                    # Telephone number of section
-            mkCE(fields, 27)                            # Outside Site(s) where observation may be performed
-            mkoXAD(fields, 28)                          # Address of outside site(s)
-            mkXTN(fields, 29, False)                    # Phone number of outside site(s)
-            mkCE(fields, 33)                            # Contraditions to observation
-        elif seg == 'OM7':                                  # De-identify OM7-20
-            mkXCN(fields, 20, compSep, True)            # Ordered by
-        elif seg == 'LOC':                                  # De-identify LOC-1,2,4,5,6
-            mkText(fields, 1)                           # Primary Key Value - LOC
-            mkText(fields, 2)                           # Location Description
-            mkXON(fields, 4)                            # Organisation name
-            mkoXAD(fields, 5)                           # Location address
-            mkXTN(fields, 6, False)                     # Location telephone
-        elif seg == 'LRL':                                  # De-identify LRL-1,4,5,6
-            mkText(fields, 1)                           # Primary Key Value - LOC
-            mkCE(fields, 4)                             # Location relationship ID
-            mkXON(fields, 5)                            # Organisation Location relationship value
-            mkText(fields, 6)                           # Patient Location relationship avlue
-        elif seg == 'LDP':                                  # De-identify LDP-1,2,11
-            mkText(fields, 1)                           # Primary Key Value - LOC
-            mkCE(fields, 2)                             # Location department
-            mkXTN(fields, 11, False)                    # Contact phone
-        elif seg == 'LCC':                                  # De-identify LCC-1
-            mkText(fields, 1)                           # Primary Key Value - LOC
-        elif seg == 'CM0':                                  # De-identify CM0-5,9,10
+                if 'OM1-' + str(field) in deidentify:
+                    mkText(fields, field)
+            if 'OM1-16' in deidentify:                          # Observation producing department/section
+                mkCE(fields, 16)
+            mkXTN(fields, 17, False)                            # Telephone number of section
+            if 'OM1-27' in deidentify:                          # Outside Site(s) where observation may be performed
+                mkCE(fields, 27)
+            mkoXAD(fields, 28)                                  # Address of outside site(s)
+            mkXTN(fields, 29, False)                            # Phone number of outside site(s)
+            if 'OM1-33' in deidentify:                          # Contraditions to observation
+                mkCE(fields, 33)
+        elif seg == 'OM7':                                              # De-identify OM7-20
+            mkXCN(fields, 20, compSep, True)                    # Ordered by
+        elif seg == 'LOC':                                              # De-identify LOC-1,2,4,5,6
+            if 'LOC-1' in deidentify:                           # Primary Key Value - LOC
+                mkText(fields, 1)
+            mkText(fields, 2)                                   # Location Description
+            mkXON(fields, 4)                                    # Organisation name
+            mkoXAD(fields, 5)                                   # Location address
+            mkXTN(fields, 6, False)                             # Location telephone
+        elif seg == 'LRL':                                              # De-identify LRL-1,4,5,6
+            if 'LRL-1' in deidentify:                           # Primary Key Value - LOC
+                mkText(fields, 1)
+            if 'LRL-4' in deidentify:                           # Location relationship ID
+                mkCE(fields, 4)
+            if 'LRL-5' in deidentify:                           # Organisation Location relationship value
+                mkXON(fields, 5)
+            if 'LRL-6' in deidentify:                           # Patient Location relationship value
+                mkText(fields, 6)
+        elif seg == 'LDP':                                              # De-identify LDP-1,2,11
+            if 'LDP-1' in deidentify:                           # Primary Key Value - LOC
+                mkText(fields, 1)
+            mkCE(fields, 2)                                     # Location department
+            mkXTN(fields, 11, False)                            # Contact phone
+        elif seg == 'LCC':                                              # De-identify LCC-1
+            mkText(fields, 1)                                   # Primary Key Value - LOC
+        elif seg == 'CM0':                                              # De-identify CM0-5,9,10
             # Chairman of the study, Contact for study
             for field in [5, 9]:
                 mkXCN(fields, field, compSep, True)
-            mkXTN(fields, 10, False)                    # Contact's telephone number
+            mkXTN(fields, 10, False)                            # Contact's telephone number
         # Chapter 9 Segments
-        elif seg == 'TXA':                                  # De-identify TXA-5,9,10,11,22,23
+        elif seg == 'TXA':                                              # De-identify TXA-5,9,10,11,22,23
             # Primary Activity provider, Originator, Assigned document authenticator, distributed copies
             for field in [5, 9, 10, 11, 23]:
                 mkXCN(fields, field, compSep, True)
@@ -552,9 +655,9 @@ def deidentifyHL7message(segments):
                     comps[j] = docComps[j]
                 fields[22] = compSep.join(comps)
         # Chapter 10 Segments
-        elif seg == 'ARQ':                                  # De-identify ARQ-15
-            mkXCN(fields, 15, compSep, True)            # Placer Contact person
-        elif seg == 'SCH':                                  # De-identify SCH-12,13,14,15,16,17,18,19,20,21,22
+        elif seg == 'ARQ':                                              # De-identify ARQ-15
+            mkXCN(fields, 15, compSep, True)                    # Placer Contact person
+        elif seg == 'SCH':                                              # De-identify SCH-12,13,14,15,16,17,18,19,20,21,22
             # Placer Contact person, Filler Contact person, Entered by person
             for field in [12, 16, 20]:
                 mkXCN(fields, field, compSep, True)
@@ -567,12 +670,12 @@ def deidentifyHL7message(segments):
             # Placer Contact location, Filler Contact location, Entered by location
             for field in [15, 19, 22]:
                 mkText(fields, field)
-        elif seg == 'AIL':                                  # De-identify AIL-3
-            mkText(fields, 3)                           # Location Resource
-        elif seg == 'AIP':                                  # De-identify AIP-3
-            mkXCN(fields, 3, compSep, True)             # Personal resource
+        elif seg == 'AIL':                                              # De-identify AIL-3
+            mkText(fields, 3)                                   # Location Resource
+        elif seg == 'AIP':                                              # De-identify AIP-3
+            mkXCN(fields, 3, compSep, True)                     # Personal resource
         # Chapter 11 Segments
-        elif seg == 'PRD':                                  # De-identify PRD - replace whole segment
+        elif seg == 'PRD':                                              # De-identify PRD - replace whole segment
             newPRD = random.choice(providers)
             if len(preservePRD) > 0:
                 oldPRDfields = seg.split(fieldSep)
@@ -581,35 +684,36 @@ def deidentifyHL7message(segments):
                     if (field < len(oldPRDfields)) and (field < len(newPRDfields)):
                         newPRDfields[field] = oldPRDfields[field]
                 newPRD = '|'.join(newPIDfields)
-            newPID.replace('|', fieldSep)
+            newPRD.replace('|', fieldSep)
             newPRD.replace('~', repSep)
             newPRD.replace('^', compSep)
             newPRD.replace('&', subCompSep)
             newPRD.replace('\\', escChar)
             segments[i] = newPRD
             continue
-        elif seg == 'CTD':                                  # De-identify CTD-2,3,4,5
-            mkXPN(fields, 2)                            # Contact Name
-            mkXAD(fields, 3)                            # Contact address
-            mkText(fields, 4)                           # Contact location
-            mkXTN(fields, 5,True)                       # Contact phone
+        elif seg == 'CTD':                                              # De-identify CTD-2,3,4,5
+            mkXPN(fields, 2)                                    # Contact Name
+            mkXAD(fields, 3)                                    # Contact address
+            mkText(fields, 4)                                   # Contact location
+            mkXTN(fields, 5,True)                               # Contact phone
         # Chapter 12 Segments
-        elif seg == 'ROL':                                  # De-identify ROL-4,10,11,12
-            mkXCN(fields, 4, compSep, True)             # Role person
-            mkCE(fields, 10)                            # Organisation Unit
-            mkXAD(fields, 11)                           # address
-            mkXTN(fields, 12, True)                     # phone
-        elif seg == 'VAR':                                  # De-identify VAR-4,6
-            mkXCN(fields, 4, compSep, True)             # Variance originator
-            mkText(fields, 6)                           # Variance description
+        elif seg == 'ROL':                                              # De-identify ROL-4,10,11,12
+            mkXCN(fields, 4, compSep, True)                     # Role person
+            mkCE(fields, 10)                                    # Organisation Unit
+            mkXAD(fields, 11)                                   # address
+            mkXTN(fields, 12, True)                             # phone
+        elif seg == 'VAR':                                              # De-identify VAR-4,6
+            mkXCN(fields, 4, compSep, True)                     # Variance originator
+            if 'VAR-6' in deidentify:                           # Variance description
+                mkText(fields, 6)
         # Chapter 13 Segments - none (Clinical Laboratory Automation)
         # Chapter 14 Segments - none (Application Management)
         # Chapter 15 Segments
-        elif seg == 'AFF':                                  # De-identify AFF-2,3
-            mkXON(fields, 2)                            # Professional organisation
-            mkXAD(fields, 3)                            # Professional organisation address
-        elif seg == 'EDU':                                  # De-identify EDU-6-8
-            mkXON(fields, 6)                            # School
+        elif seg == 'AFF':                                              # De-identify AFF-2,3
+            mkXON(fields, 2)                                    # Professional organisation
+            mkXAD(fields, 3)                                    # Professional organisation address
+        elif seg == 'EDU':                                              # De-identify EDU-6-8
+            mkXON(fields, 6)                                    # School
             # an organisation name ending in Medical/Medical Clinic/Medical Centre
             if fields[6].endswith('Medical'):
                 fields[6] = fields[6][0:-7] + 'School'
@@ -617,28 +721,29 @@ def deidentifyHL7message(segments):
                 fields[6] = fields[6][0:-14] + 'School'
             elif fields[6].endswith('Medical Centre'):
                 fields[6] = fields[6][0:-14] + 'School'
-            mkXAD(fields, 8)                            # School address
-        elif seg == 'STF':                                  # De-identify SFT-3,5,6,8.9.10,11
+            mkXAD(fields, 8)                                    # School address
+        elif seg == 'STF':                                              # De-identify SFT-3,5,6,8.9.10,11
             pid = random.choice(patients)
             pidFields = pid.split(fieldSep)
-            fields[3] = pidFields[5]                    # Staff name
-            fields[5] = pidFields[8]                    # Staff sex
-            fields[6] = pidFields[7]                    # Staff DOB
-            mkCE(fields, 8)                             # Department
-            mkCE(fields, 9)                             # Hospital service
-            mkXTN(fields, 10, True)                     # Staff phone
-            fields[11] = pidFields[11]                  # Staff address
+            fields[3] = pidFields[5]                            # Staff name
+            fields[5] = pidFields[8]                            # Staff sex
+            fields[6] = pidFields[7]                            # Staff DOB
+            mkCE(fields, 8)                                     # Department
+            if 'STF-9' in deidentify:                           # Hospital service
+                mkCE(fields, 9)
+            mkXTN(fields, 10, True)                             # Staff phone
+            fields[11] = pidFields[11]                          # Staff address
             reps = pidFields[13].split(repSep)
             for rep in reps:
                 comps = rep.split(compSep)
                 if ((comps[1] == 'NET') and (comps[2] == 'Internet')):
-                    fields[15] = comps[3]               # E-Mail address
+                    fields[15] = comps[3]                       # E-Mail address
                     break
-            fields[17] = pidFields[16]                  # Marital status
-            mkText(fields, 18)                          # Job title
-            fields[22] = pidFields[20]                  # Driver's license no
-            fields[27] = pidFields[10]                  # Race
-            fields[28] = pidFields[22]                  # Ethnic Group
+            fields[17] = pidFields[16]                          # Marital status
+            mkText(fields, 18)                                  # Job title
+            fields[22] = pidFields[20]                          # Driver's license no
+            fields[27] = pidFields[10]                          # Race
+            fields[28] = pidFields[22]                          # Ethnic Group
 
         segments[i] = fieldSep.join(fields)
     return segments
@@ -877,7 +982,6 @@ def mkCE(fields, field, withFT):
     fields[field] = compSep.join(comps)
     return
 
-
 # End of deIdentifyHL7message() function and associated data/functions
 
 
@@ -923,12 +1027,15 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-I', '--inputDir', metavar='inputDir', action='store', default="./input/.", help='The name of input directory (default "./input/.")')
+    parser.add_argument('-i', '--inputFilePattern', metavar='inputFilePattern', action='store', default="*", help='The filename pattern for the input files (default "*")')
     parser.add_argument('-O', '--outputDir', metavar='outputDir', action='store', default="./output/.", help='The name of the output directory (default "./output/.")')
     parser.add_argument('-D', '--dataDir', metavar='dataDir', action='store', default="./data/.", help='The name of the data directory (default "./data/.")')
+    parser.add_argument('-P', '--preserveMR', action='store_true', default=False, help='Preserve MR and assigning authority in PID segment')
+    parser.add_argument('-T', '--testData', metavar='testData', action='store', default="testHealthPopulation.xlsx",
+                        help='The name of the test data Excel Workbook (default "testHealthPopulation.xlsx")')
     parser.add_argument('-p', '--preservePID', metavar='preservePID', action='store', default="", help='A comma separted list of PID fields to preserve')
-    parser.add_argument('-P', '--preservePRD', metavar='preservePRD', action='store', default="", help='A comma separted list of PRD fields to preserve')
+    parser.add_argument('-d', '--preservePRD', metavar='preservePRD', action='store', default="", help='A comma separted list of PRD fields to preserve')
     parser.add_argument('-v', '--verbose', metavar='loggingLevel', type=int, choices=range(0, 5), help='The level of logging\n\t0=CRITICAL,1=ERROR,2=WARNING,3=INFO,4=DEBUG')
-    parser.add_argument('-T', '--testData', metavar='testData', action='store', default="testHealthPopulation.xlsx", help='The name of the test data Excel Workbook (default "testHealthPopulation.xlsx")')
     parser.add_argument('-l', '--logfile', metavar='logfile', action='store', help='The name of the log file')
     parser.add_argument('-L', '--logDir', metavar='logDir', action='store', default=".", help='The name of the logging directory (default ".")')
     args = parser.parse_args()
@@ -952,8 +1059,10 @@ if __name__ == '__main__':
 
     # Parse the optional arguments
     inputDir = args.inputDir
+    inputFilePattern = args.inputFilePattern
     outputDir = args.outputDir
     dataDir = args.dataDir
+    preserveMR = args.preserveMR
     testHealthPopulation = args.testData
     preservePID = args.preservePID
     preservePRD = args.preservePRD
@@ -970,7 +1079,7 @@ if __name__ == '__main__':
             del preservePRD[i]
 
     # De-identify all the HL7 message files in the inputDir and write the de-identified messages out to the outputDir
-    HL7files = glob.glob(os.path.join(inputDir, '*'))
+    HL7files = glob.glob(os.path.join(inputDir, inputFilePattern))
     for HL7file in HL7files:
         with open(os.path.join(outputDir, os.path.basename(HL7file)), 'w', newline='\r') as outFile:
             with open(HL7file, 'r', newline='\r') as inFile:
