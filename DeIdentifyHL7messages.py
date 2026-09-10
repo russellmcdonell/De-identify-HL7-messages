@@ -1,5 +1,5 @@
 '''
-A script (and a function) to partially de-identify an HL7 message.
+A script (and a function) to partially de-identify an HL7 v2.x message.
 Full de-identification is not possible without knowing the details of any HL7 extensions
 that exist in the message, such as extra fields in segments, or Z segments.
 And missed de-identification can occur if senders misuse standard fields for non-standard data,
@@ -48,7 +48,9 @@ testHealthPopulation = 'testHealthPopulation.xlsx'
 # which can be created with the mkHealthPopulation.py script (https://github.com/russellmcdonell/mkHealth_Population-Australia)
 def deidentifyHL7message(segments):
     # Deidentify an HL7 message
-    global LoremIpsum, LOremIpsum_PDF, LoremIpsum_PNG, LoremIpsum_GIF, LoremIpsum_JPG, LoremIpsum_TIFF, allText, allFT,  wb, patients, doctors, providers, fieldSep, compSep, repSep, escChar, subCompSep, dataDir
+    global LoremIpsum, LOremIpsum_PDF, LoremIpsum_PNG, LoremIpsum_GIF, LoremIpsum_JPG, LoremIpsum_TIFF, allText, allFT
+    global wb, patients, doctors, providers, fieldSep, compSep, repSep, escChar, subCompSep, dataDir
+    global preservePID, preservePRD
     if len(LoremIpsum) == 0:
         with open(os.path.join(dataDir, "LoremIpsum.txt"), 'r', newline='') as LoremIpsumFile:
             for para in LoremIpsumFile:
@@ -201,6 +203,18 @@ def deidentifyHL7message(segments):
                 else:
                     newPID = newPID.replace('<UR>', str(99999999))
                     newPID = newPID.replace('<AUTH>', 'unknown')
+            if len(preservePID) > 0:
+                oldPIDfields = seg.split(fieldSep)
+                newPIDfields = newPID.split('|')
+                for field in preservePID:
+                    if (field < len(oldPIDfields)) and (field < len(newPIDfields)):
+                        newPIDfields = oldPIDfields[preservePID[i]]
+                newPID = '|'.join(newPIDfields)
+            newPID.replace('|', fieldSep)
+            newPID.replace('~', repSep)
+            newPID.replace('^', compSep)
+            newPID.replace('&', subCompSep)
+            newPID.replace('\\', escChar)
             segments[i] = newPID
             continue
         elif seg == 'PV1':                                  # De-identify PV1-3,6,7,8,9,11,14,15,16,17,42,43,52
@@ -560,6 +574,18 @@ def deidentifyHL7message(segments):
         # Chapter 11 Segments
         elif seg == 'PRD':                                  # De-identify PRD - replace whole segment
             newPRD = random.choice(providers)
+            if len(preservePRD) > 0:
+                oldPRDfields = seg.split(fieldSep)
+                newPRDfields = newPRDfields.split('|')
+                for field in preservePRD:
+                    if (field < len(oldPRDfields)) and (field < len(newPRDfields)):
+                        newPRDfields[field] = oldPRDfields[field]
+                newPRD = '|'.join(newPIDfields)
+            newPID.replace('|', fieldSep)
+            newPRD.replace('~', repSep)
+            newPRD.replace('^', compSep)
+            newPRD.replace('&', subCompSep)
+            newPRD.replace('\\', escChar)
             segments[i] = newPRD
             continue
         elif seg == 'CTD':                                  # De-identify CTD-2,3,4,5
@@ -899,6 +925,8 @@ if __name__ == '__main__':
     parser.add_argument('-I', '--inputDir', metavar='inputDir', action='store', default="./input/.", help='The name of input directory (default "./input/.")')
     parser.add_argument('-O', '--outputDir', metavar='outputDir', action='store', default="./output/.", help='The name of the output directory (default "./output/.")')
     parser.add_argument('-D', '--dataDir', metavar='dataDir', action='store', default="./data/.", help='The name of the data directory (default "./data/.")')
+    parser.add_argument('-p', '--preservePID', metavar='preservePID', action='store', default="", help='A comma separted list of PID fields to preserve')
+    parser.add_argument('-P', '--preservePRD', metavar='preservePRD', action='store', default="", help='A comma separted list of PRD fields to preserve')
     parser.add_argument('-v', '--verbose', metavar='loggingLevel', type=int, choices=range(0, 5), help='The level of logging\n\t0=CRITICAL,1=ERROR,2=WARNING,3=INFO,4=DEBUG')
     parser.add_argument('-T', '--testData', metavar='testData', action='store', default="testHealthPopulation.xlsx", help='The name of the test data Excel Workbook (default "testHealthPopulation.xlsx")')
     parser.add_argument('-l', '--logfile', metavar='logfile', action='store', help='The name of the log file')
@@ -927,6 +955,19 @@ if __name__ == '__main__':
     outputDir = args.outputDir
     dataDir = args.dataDir
     testHealthPopulation = args.testData
+    preservePID = args.preservePID
+    preservePRD = args.preservePRD
+
+    preservePID = preservePID.strip().split(',')
+    for i in range(len(preservePID) -1, -1, -1):
+        preservePID[i] = preservePID[i].strip()
+        if preservePID[i] == '':
+            del preservePID[i]
+    preservePRD = preservePRD.strip().split(',')
+    for i in range(len(preservePRD) -1, -1, -1):
+        preservePRD[i] = preservePRD[i].strip()
+        if preservePRD[i] == '':
+            del preservePRD[i]
 
     # De-identify all the HL7 message files in the inputDir and write the de-identified messages out to the outputDir
     HL7files = glob.glob(os.path.join(inputDir, '*'))
